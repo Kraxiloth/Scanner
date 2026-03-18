@@ -6,6 +6,7 @@
 <title>Sorcery Scanner</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;900&family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300;1,400&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
   :root {
     --bg: #0d0b0e;
@@ -565,6 +566,56 @@
 
   /* Canvas for motion detection (hidden) */
   #motion-canvas { display: none; }
+  /* OCR crop canvas (hidden) */
+  #ocr-canvas { display: none; }
+
+  /* OCR status bar */
+  .ocr-status {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .ocr-status.visible { display: flex; }
+  .ocr-spinner {
+    width: 16px; height: 16px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .ocr-status-text {
+    font-family: 'Cinzel', serif;
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    flex: 1;
+  }
+  .ocr-raw {
+    font-size: 11px;
+    color: var(--accent);
+    font-style: italic;
+    font-family: 'Crimson Pro', serif;
+    max-width: 130px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* No-match state */
+  .no-match-hint {
+    font-size: 13px;
+    color: var(--text-muted);
+    font-style: italic;
+    text-align: center;
+    padding: 8px 0;
+  }
 </style>
 </head>
 <body>
@@ -594,6 +645,7 @@
     <!-- Live feed (hidden until started) -->
     <video id="camera-video" autoplay playsinline muted style="display:none"></video>
     <canvas id="motion-canvas"></canvas>
+    <canvas id="ocr-canvas"></canvas>
 
     <div class="camera-overlay" id="camera-overlay" style="display:none">
       <div class="card-guide">
@@ -603,6 +655,13 @@
       <div class="motion-indicator" id="motion-indicator"></div>
       <div class="camera-status" id="camera-status">Waiting for card…</div>
     </div>
+  </div>
+
+  <!-- OCR status bar -->
+  <div class="ocr-status" id="ocr-status">
+    <div class="ocr-spinner"></div>
+    <span class="ocr-status-text" id="ocr-status-text">Reading card…</span>
+    <span class="ocr-raw" id="ocr-raw"></span>
   </div>
 
   <!-- Identification area -->
@@ -724,14 +783,26 @@ function switchTab(tab) {
 }
 
 // ═══════════════════════════════════════════
-// CAMERA + MOTION DETECTION
+// CAMERA + MOTION DETECTION + OCR
 // ═══════════════════════════════════════════
 let stream = null;
 let motionTimer = null;
 let prevFrame = null;
-let motionActive = false;
 let cardPresent = false;
+let ocrBusy = false;
+let tesseractWorker = null;
 let rafId = null;
+
+// Initialise Tesseract worker once
+async function initTesseract() {
+  tesseractWorker = await Tesseract.createWorker('eng', 1, {
+    logger: () => {} // suppress log noise
+  });
+  await tesseractWorker.setParameters({
+    tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\'- ",
+    tessedit_pageseg_mode: '7', // treat as single text line
+  });
+}
 
 async function startCamera() {
   try {
@@ -743,6 +814,13 @@ async function startCamera() {
     document.getElementById('camera-start').style.display = 'none';
     video.style.display = 'block';
     document.getElementById('camera-overlay').style.display = 'block';
+
+    // Start Tesseract init in background while camera warms up
+    document.getElementById('camera-status').textContent = 'Loading OCR engine…';
+    initTesseract().then(() => {
+      document.getElementById('camera-status').textContent = 'Ready — place card in frame';
+    });
+
     video.addEventListener('playing', startMotionDetection);
   } catch (e) {
     alert('Camera access denied or unavailable. Please allow camera access and try again.');
@@ -757,13 +835,19 @@ function startMotionDetection() {
   canvas.height = 120;
 
   function tick() {
+    // Don't run motion detection while OCR is running or card already identified
+    if (ocrBusy || cardPresent) {
+      rafId = requestAnimationFrame(tick);
+      return;
+    }
+
     ctx.drawImage(video, 0, 0, 160, 120);
     const frame = ctx.getImageData(0, 0, 160, 120);
 
     if (prevFrame) {
       let diff = 0;
       const d1 = prevFrame.data, d2 = frame.data;
-      const step = 8; // sample every 8th pixel for speed
+      const step = 8;
       let count = 0;
       for (let i = 0; i < d1.length; i += 4 * step) {
         diff += Math.abs(d1[i] - d2[i]) + Math.abs(d1[i+1] - d2[i+1]) + Math.abs(d1[i+2] - d2[i+2]);
@@ -775,25 +859,18 @@ function startMotionDetection() {
       const status = document.getElementById('camera-status');
 
       if (avgDiff > 12) {
-        // Motion detected
         indicator.className = 'motion-indicator active';
-        cardPresent = false;
         if (motionTimer) { clearTimeout(motionTimer); motionTimer = null; }
         status.textContent = 'Motion detected…';
       } else if (avgDiff > 3) {
-        // Slight motion / settling
         indicator.className = 'motion-indicator';
-        if (!motionTimer && !cardPresent) {
-          motionTimer = setTimeout(() => {
-            // Card settled — check if something is actually there vs empty background
-            checkForCard(video, ctx, canvas);
-          }, 900);
+        if (!motionTimer) {
+          motionTimer = setTimeout(() => snapAndOCR(video), 900);
         }
       } else {
-        // Still
-        if (!cardPresent) {
+        if (!motionTimer) {
           indicator.className = 'motion-indicator';
-          status.textContent = 'Waiting for card…';
+          if (tesseractWorker) status.textContent = 'Ready — place card in frame';
         }
       }
     }
@@ -804,42 +881,154 @@ function startMotionDetection() {
   rafId = requestAnimationFrame(tick);
 }
 
-function checkForCard(video, ctx, canvas) {
-  // Sample the center region where the card guide is
-  // Compare center brightness variance — a card will have more texture than plain white paper
-  ctx.drawImage(video, 0, 0, 160, 120);
-  const center = ctx.getImageData(40, 30, 80, 60); // center crop
-  let brightSum = 0, count = 0;
+// ── Snap the video frame and run OCR on the title strip ──
+async function snapAndOCR(video) {
+  motionTimer = null;
+  if (ocrBusy || !tesseractWorker) return;
+
+  // Check brightness first — reject if still looks like empty white background
+  const motCtx = document.getElementById('motion-canvas').getContext('2d', { willReadFrequently: true });
+  motCtx.drawImage(video, 0, 0, 160, 120);
+  const center = motCtx.getImageData(40, 30, 80, 60);
+  let brightSum = 0, cnt = 0;
   for (let i = 0; i < center.data.length; i += 4) {
-    const lum = (center.data[i] * 0.299 + center.data[i+1] * 0.587 + center.data[i+2] * 0.114);
-    brightSum += lum;
-    count++;
+    brightSum += center.data[i] * 0.299 + center.data[i+1] * 0.587 + center.data[i+2] * 0.114;
+    cnt++;
   }
-  const avgBrightness = brightSum / count;
-
-  const indicator = document.getElementById('motion-indicator');
-  const status = document.getElementById('camera-status');
-
-  // If center is very bright (>220), likely still empty white background
-  if (avgBrightness > 215) {
-    indicator.className = 'motion-indicator still';
-    status.textContent = 'Place card in frame…';
-    cardPresent = false;
-    motionTimer = null;
+  if (brightSum / cnt > 215) {
+    document.getElementById('camera-status').textContent = 'Ready — place card in frame';
+    document.getElementById('motion-indicator').className = 'motion-indicator';
     return;
   }
 
-  // Card detected!
-  cardPresent = true;
-  indicator.className = 'motion-indicator still';
-  status.textContent = 'Card detected · Identify below';
-  motionTimer = null;
+  ocrBusy = true;
+  document.getElementById('motion-indicator').className = 'motion-indicator still';
+  document.getElementById('camera-status').textContent = 'Card detected — reading…';
 
-  // Focus search input
-  setTimeout(() => {
-    const inp = document.getElementById('search-input');
-    if (inp) inp.focus();
-  }, 200);
+  // ── Draw high-res crop of the card title region to OCR canvas ──
+  // Sorcery cards: title is in the top ~13% of the card face.
+  // The card guide sits roughly in the centre 56% width of the video.
+  const ocrCanvas = document.getElementById('ocr-canvas');
+  const ocrCtx = ocrCanvas.getContext('2d');
+
+  const vw = video.videoWidth  || 1280;
+  const vh = video.videoHeight || 720;
+
+  // Map guide frame position to video pixel coords
+  // Guide is 56% wide, centred, aspect ratio 2.5:3.5
+  const guideW = vw * 0.56;
+  const guideH = guideW * (3.5 / 2.5);
+  const guideX = (vw - guideW) / 2;
+  const guideY = (vh - guideH) / 2;
+
+  // Title strip: top 13% of card, inset 5% horizontally
+  const stripX = guideX + guideW * 0.05;
+  const stripY = guideY + guideH * 0.04;
+  const stripW = guideW * 0.90;
+  const stripH = guideH * 0.13;
+
+  // Draw at 3× scale for better OCR accuracy
+  const scale = 3;
+  ocrCanvas.width  = stripW * scale;
+  ocrCanvas.height = stripH * scale;
+
+  // Preprocessing: draw, then boost contrast
+  ocrCtx.drawImage(video,
+    stripX, stripY, stripW, stripH,
+    0, 0, ocrCanvas.width, ocrCanvas.height
+  );
+
+  // Contrast + grayscale filter for better OCR
+  const imgData = ocrCtx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
+  const d = imgData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    // Grayscale
+    const gray = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+    // High contrast: push toward black or white
+    const boosted = gray < 128 ? Math.max(0, gray - 40) : Math.min(255, gray + 40);
+    d[i] = d[i+1] = d[i+2] = boosted;
+  }
+  ocrCtx.putImageData(imgData, 0, 0);
+
+  // Show OCR status bar
+  const ocrStatusEl = document.getElementById('ocr-status');
+  const ocrStatusText = document.getElementById('ocr-status-text');
+  const ocrRaw = document.getElementById('ocr-raw');
+  ocrStatusEl.classList.add('visible');
+  ocrStatusText.textContent = 'Reading card name…';
+  ocrRaw.textContent = '';
+
+  try {
+    const result = await tesseractWorker.recognize(ocrCanvas);
+    const rawText = result.data.text.trim().replace(/[^A-Za-z\'\- ]/g, '').trim();
+    ocrRaw.textContent = rawText || '(no text)';
+
+    if (!rawText || rawText.length < 2) {
+      ocrStatusText.textContent = 'Could not read — try repositioning';
+      showOcrResults([]);
+    } else {
+      ocrStatusText.textContent = 'Matched against database';
+      const matches = searchCards(rawText);
+      showOcrResults(matches, rawText);
+    }
+  } catch (err) {
+    ocrStatusText.textContent = 'OCR error — try again';
+    showOcrResults([]);
+  }
+
+  ocrBusy = false;
+  cardPresent = true;
+}
+
+// ── Display OCR results as suggestion buttons ──
+function showOcrResults(matches, rawText) {
+  // Switch to search step and populate
+  document.querySelectorAll('.ident-step').forEach(s => s.classList.remove('active'));
+  document.getElementById('step-search').classList.add('active');
+
+  const topDiv = document.getElementById('top-matches');
+  const showAllBtn = document.getElementById('show-all-btn');
+  const fullList = document.getElementById('full-list');
+  const searchInput = document.getElementById('search-input');
+
+  // Pre-fill search with OCR text so user can refine
+  if (rawText) searchInput.value = rawText;
+
+  const top3 = matches.slice(0, 3);
+
+  if (top3.length === 0) {
+    topDiv.innerHTML = '<div class="no-match-hint">No matches found — try typing the card name below</div>';
+    showAllBtn.style.display = 'none';
+    fullList.classList.remove('visible');
+    return;
+  }
+
+  topDiv.innerHTML = top3.map((r, i) => {
+    const pct = Math.round(r.score * 100);
+    const sets = [...new Set(r.card.variants.map(v => v.set))].join(', ');
+    return `<button class="match-btn ${i === 0 ? 'top-match' : ''}" onclick="selectCard('${escHtml(r.card.name)}')">
+      <div>
+        <div class="match-name">${escHtml(r.card.name)}</div>
+        <div class="match-meta">${escHtml(r.card.type)} · ${escHtml(r.card.rarity)} · ${escHtml(sets)}</div>
+      </div>
+      <div class="match-score">${pct}%</div>
+    </button>`;
+  }).join('');
+
+  if (matches.length > 3) {
+    showAllBtn.style.display = 'block';
+    showAllBtn.textContent = `Show all ${matches.length} results ▾`;
+    // Populate full list
+    fullList.innerHTML = matches.map(r => {
+      const sets = [...new Set(r.card.variants.map(v => v.set))].join(', ');
+      return `<div class="list-item" onclick="selectCard('${escHtml(r.card.name)}')">
+        <span>${escHtml(r.card.name)}</span>
+        <span class="list-item-meta">${escHtml(r.card.type)} · ${escHtml(sets)}</span>
+      </div>`;
+    }).join('');
+  } else {
+    showAllBtn.style.display = 'none';
+  }
 }
 
 // ═══════════════════════════════════════════
@@ -936,9 +1125,13 @@ function backToSearch() {
   document.getElementById('search-input').value = '';
   document.getElementById('top-matches').innerHTML = '';
   document.getElementById('show-all-btn').style.display = 'none';
+  document.getElementById('full-list').classList.remove('visible');
+  document.getElementById('ocr-status').classList.remove('visible');
   cardPresent = false;
+  ocrBusy = false;
+  prevFrame = null; // force fresh motion baseline
   if (document.getElementById('camera-status'))
-    document.getElementById('camera-status').textContent = 'Waiting for card…';
+    document.getElementById('camera-status').textContent = 'Ready — place card in frame';
 }
 
 function confirmVariant(name, variant) {
